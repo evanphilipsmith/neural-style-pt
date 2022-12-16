@@ -113,10 +113,10 @@ class ModelParallel(nn.Module):
     def name_devices(self, input_list):
         device_list = []
         for i, device in enumerate(input_list):
-            if str(device).lower() != 'c':
+            if str(device).lower() not in ("cpu", "mps"):
                 device_list.append("cuda:" + str(device))
             else:
-                device_list.append("cpu")
+                device_list.append(device)
         return device_list
 
     def split_net(self, net, device_splits):
