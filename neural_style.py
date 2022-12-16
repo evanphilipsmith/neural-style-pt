@@ -1,5 +1,4 @@
 import os
-import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -41,7 +40,7 @@ parser.add_argument("-original_colors", type=int, choices=[0, 1], default=0)
 parser.add_argument("-pooling", choices=['avg', 'max'], default='max')
 parser.add_argument("-model_file", type=str, default='models/vgg19-d01eb7cb.pth')
 parser.add_argument("-disable_check", action='store_true')
-parser.add_argument("-backend", choices=['nn', 'cudnn', 'mkl', 'mkldnn', 'openmp', 'mkl,cudnn', 'cudnn,mkl'], default='nn')
+parser.add_argument("-backend", choices=['nn', 'cudnn', 'mkl', 'mkldnn', 'openmp', 'mkl,cudnn', 'cudnn,mkl', 'mps'], default='nn')
 parser.add_argument("-cudnn_autotune", action='store_true')
 parser.add_argument("-seed", type=int, default=-1)
 
@@ -56,11 +55,11 @@ Image.MAX_IMAGE_PIXELS = 1000000000 # Support gigapixel images
 
 
 def main():
-    dtype, multidevice, backward_device = setup_gpu()
+    multidevice, backward_device = setup_gpu()
 
-    cnn, layerList = loadCaffemodel(params.model_file, params.pooling, params.gpu, params.disable_check)
+    cnn, layerList = loadCaffemodel(params.model_file, params.pooling, params.disable_check)
 
-    content_image = preprocess(params.content_image, params.image_size).type(dtype)
+    content_image = preprocess(params.content_image, params.image_size).to(backward_device)
     style_image_input = params.style_image.split(',')
     style_image_list, ext = [], [".jpg", ".jpeg", ".png", ".tiff"]
     for image in style_image_input:
@@ -73,12 +72,12 @@ def main():
     style_images_caffe = []
     for image in style_image_list:
         style_size = int(params.image_size * params.style_scale)
-        img_caffe = preprocess(image, style_size).type(dtype)
+        img_caffe = preprocess(image, style_size).to(backward_device)
         style_images_caffe.append(img_caffe)
 
     if params.init_image != None:
         image_size = (content_image.size(2), content_image.size(3))
-        init_image = preprocess(params.init_image, image_size).type(dtype)
+        init_image = preprocess(params.init_image, image_size).to(backward_device)
 
     # Handle style blending weights for multiple style inputs
     style_blend_weights = []
@@ -105,13 +104,12 @@ def main():
     style_layers = params.style_layers.split(',')
 
     # Set up the network, inserting style and content loss modules
-    cnn = copy.deepcopy(cnn)
     content_losses, style_losses, tv_losses = [], [], []
     next_content_idx, next_style_idx = 1, 1
     net = nn.Sequential()
     c, r = 0, 0
     if params.tv_weight > 0:
-        tv_mod = TVLoss(params.tv_weight).type(dtype)
+        tv_mod = TVLoss(params.tv_weight)
         net.add_module(str(len(net)), tv_mod)
         tv_losses.append(tv_mod)
 
@@ -155,7 +153,9 @@ def main():
                 net.add_module(str(len(net)), layer)
 
     if multidevice:
-        net = setup_multi_device(net)
+        net = setup_multi_device(net, params.gpu, params.multidevice_strategy)
+    else:
+        net = net.to(backward_device)
 
     # Capture content targets
     for i in content_losses:
@@ -197,7 +197,7 @@ def main():
         torch.backends.cudnn.deterministic=True
     if params.init == 'random':
         B, C, H, W = content_image.size()
-        img = torch.randn(C, H, W).mul(0.001).unsqueeze(0).type(dtype)
+        img = torch.randn(C, H, W).mul(0.001).unsqueeze(0).to(backward_device)
     elif params.init == 'image':
         if params.init_image != None:
             img = init_image.clone()
@@ -296,37 +296,46 @@ def setup_gpu():
         if 'mkl' in params.backend and 'mkldnn' not in params.backend:
             torch.backends.mkl.enabled = True
         elif 'mkldnn' in params.backend:
-            raise ValueError("MKL-DNN is not supported yet.")
+            torch.backends.mkldnn.enabled = True
         elif 'openmp' in params.backend:
             torch.backends.openmp.enabled = True
+
+    def setup_mps():
+        if 'mps' in params.backend:
+            assert torch.backends.mps.is_available()
 
     multidevice = False
     if "," in str(params.gpu):
         devices = params.gpu.split(',')
         multidevice = True
 
-        if 'c' in str(devices[0]).lower():
+        if 'cpu' in str(devices[0]).lower():
             backward_device = "cpu"
             setup_cuda(), setup_cpu()
+        elif 'mps' in str(devices[0]).lower():
+            backward_device = "mps"
+            setup_mps(), setup_cuda(), setup_cpu()
         else:
             backward_device = "cuda:" + devices[0]
             setup_cuda()
-        dtype = torch.FloatTensor
 
-    elif "c" not in str(params.gpu).lower():
+    elif "cpu" not in str(params.gpu).lower() and "mps" not in str(params.gpu).lower():
         setup_cuda()
-        dtype, backward_device = torch.cuda.FloatTensor, "cuda:" + str(params.gpu)
+        backward_device = "cuda:" + str(params.gpu)
+    elif "mps" in str(params.gpu).lower():
+        setup_mps()
+        backward_device = "mps"
     else:
         setup_cpu()
-        dtype, backward_device = torch.FloatTensor, "cpu"
-    return dtype, multidevice, backward_device
+        backward_device = "cpu"
+    return multidevice, backward_device
 
 
-def setup_multi_device(net):
-    assert len(params.gpu.split(',')) - 1 == len(params.multidevice_strategy.split(',')), \
+def setup_multi_device(net, device, multidevice_strategy):
+    assert len(device.split(',')) - 1 == len(multidevice_strategy.split(',')), \
       "The number of -multidevice_strategy layer indices minus 1, must be equal to the number of -gpu devices."
 
-    new_net = ModelParallel(net, params.gpu, params.multidevice_strategy)
+    new_net = ModelParallel(net, device, multidevice_strategy)
     return new_net
 
 
